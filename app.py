@@ -2,12 +2,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import io, requests, socket
+import io, requests, socket, urllib3
 from datetime import datetime
 from pipeline import get_titan_data
 from opp import TitanOpp
 
-# --- [修正 3] 名單 Cache 與 異常判斷 ---
+# 禁用不安全請求警告（因為我們會使用 verify=False）
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- [關鍵修正] 增加 verify=False 以跳過雲端環境對證交所的 SSL 檢查 ---
 @st.cache_data(ttl=86400)
 def get_all_taiwan_symbols():
     url_twse = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
@@ -16,7 +19,8 @@ def get_all_taiwan_symbols():
     def fetch_codes(url, suffix):
         out = []
         try:
-            r = requests.get(url, timeout=15)
+            # 在這裡加入 verify=False，解決雲端主機不認得證交所憑證的問題
+            r = requests.get(url, timeout=15, verify=False)
             r.encoding = 'cp950'
             df = pd.read_html(io.StringIO(r.text))[0]
             df.columns = df.iloc[0]
@@ -48,6 +52,7 @@ st.title("🛡️ 鋼鐵泰坦 v11.9：核心戰情終端")
 if "stop_scan" not in st.session_state:
     st.session_state.stop_scan = False
 
+# 基礎監控池
 target_symbols = ["2330.TW", "2454.TW", "2317.TW", "2382.TW", "3231.TW", "1513.TW", "1519.TW", "1605.TW", "2618.TW", "2308.TW", "2376.TW", "2449.TW", "3034.TW", "3037.TW", "1503.TW", "3711.TW"]
 
 @st.cache_data(ttl=3600)
@@ -85,7 +90,7 @@ col3.metric("大盤神盾", "🛡️ ON" if shield_on else "⚠️ OFF")
 st.subheader(f"🎯 狙擊目標清單 ({last_date.date()})")
 
 if scan_mode == "🔥 全台股大掃描 (6mo 暖機)":
-    # [修正 2] 雙按鈕介面，加入即時 Rerun 機制
+    # 雙按鈕介面
     cA, cB = st.columns([1,1])
     with cA:
         start_scan = st.button("🚀 啟動全市場自動偵蒐")
@@ -98,9 +103,9 @@ if scan_mode == "🔥 全台股大掃描 (6mo 暖機)":
         st.session_state.stop_scan = False
         all_codes = get_all_taiwan_symbols()
         
-        # [修正 3] 名單數量異常檢查
+        # 名單數量異常檢查
         if len(all_codes) < 500:
-            st.error(f"❌ 名單取得異常（僅 {len(all_codes)} 檔），請檢查 TWSE/TPEX 網頁格式或稍後再試。")
+            st.error(f"❌ 名單取得異常（僅 {len(all_codes)} 檔），請檢查來源網頁或稍後再試。")
             st.stop()
             
         progress_bar = st.progress(0)
@@ -109,14 +114,14 @@ if scan_mode == "🔥 全台股大掃描 (6mo 暖機)":
         
         for i, s in enumerate(all_codes):
             if st.session_state.stop_scan:
-                st.warning("已收到指令，停止掃描。")
+                st.warning("已停止掃描。")
                 break
                 
             status_text.text(f"正在偵蒐: {s} ({i+1}/{len(all_codes)})")
             progress_bar.progress((i + 1) / len(all_codes))
             
             try:
-                # 口徑一致：auto_adjust=False
+                # auto_adjust=False 確保口徑一致
                 df = yf.download(s, period="6mo", progress=False, auto_adjust=False)
                 if len(df) < 60: continue
                 
@@ -125,15 +130,14 @@ if scan_mode == "🔥 全台股大掃描 (6mo 暖機)":
                 close = df['Close'].iloc[-1]
                 vol = df['Volume'].iloc[-1]
                 
-                # [修正 4] 成交量 NaN 與 零值檢查
                 if pd.isna(vol) or vol <= 0 or pd.isna(ma50) or pd.isna(high20) or pd.isna(close): 
                     continue
                 
-                # 流動性粗濾 (成交量 * 收盤價 >= 4,000 萬)
+                # 流動性粗濾 (4,000 萬)
                 val = close * vol
                 if val < 40_000_000: continue
                 
-                # 價格與突破判定 (30-300 元)
+                # 突破判定
                 if 30 <= close <= 300 and close > high20 and close > ma50:
                     results.append({"代號": s, "現價": round(close, 2), "狀態": "🎯 突破"})
             except:
@@ -157,19 +161,12 @@ else:
         rows = []
         for s in signals:
             bar = all_data[s].loc[last_date]
-            
-            # [修正 1] RS_Score NaN 防守
             rs_score = float(bar['RS_Score']) if (not pd.isna(bar['RS_Score'])) else None
-            
-            # 量能倍數防守
             vol_mult = (bar['Volume'] / bar['VolMA20']) if (not pd.isna(bar['VolMA20']) and bar['VolMA20'] > 0) else np.nan
-            
-            # 成交值與 ATR NaN 防守
             avg_val20 = int(bar['AvgVal20']) if (not pd.isna(bar['AvgVal20'])) else None
             atr = float(bar['ATR']) if (not pd.isna(bar['ATR'])) else None
             entry = float(bar['Close'])
             
-            # 安全計算停損停利
             if atr is None:
                 sl, tp1 = None, None
             else:
@@ -189,9 +186,6 @@ else:
         st.table(pd.DataFrame(rows))
     else:
         st.warning("精選池目前未達標，請耐心等待訊號。")
-
-with st.expander("📱 手機連線教學"):
-    st.write(f"在手機瀏覽器輸入：`http://{get_local_ip()}:8501` (需同 Wi-Fi)")
 
 st.markdown("---")
 st.caption(f"數據更新基準日：{last_date} | 鋼鐵泰坦 v11.9 PRO")
